@@ -47,7 +47,7 @@ static int ensure_parent_dir(void) {
   return r;
 }
 
-static int intlen(int n) {
+static int intlen(unsigned long n) {
   int l;
 
   for (l = 1;; ++l) {
@@ -58,7 +58,7 @@ static int intlen(int n) {
   return l;
 }
 
-static void print_int(char* s, int n, int l) {
+static void print_int(char* s, unsigned long n, int l) {
   s += l;
   for (;;) {
     const char digits[] = "0123456789";
@@ -85,7 +85,7 @@ static int open_and_lock(const char* file) {
   return fd;
 }
 
-static inline void print_filename(char* s, int uid, int l) {
+static inline void print_filename(char* s, uid_t uid, int l) {
   /* construct file name, e.g: "/run/users/.1000" */
   memcpy(s, PARENT_DIR, sizeof(PARENT_DIR) - 1);
   s[sizeof(PARENT_DIR) - 1] = '/';
@@ -162,9 +162,9 @@ static int write_counter(int fd, int count) {
     else
       buf[0] = '-';
 
-    for (;;) {
-      int w = 0;
+    int w = 0;
 
+    for (;;) {
       r = write(fd, buf + w, l - w);
       if (r < 0) {
         if (errno == EINTR) continue;
@@ -184,37 +184,42 @@ static int write_counter(int fd, int count) {
   return r;
 }
 
-static int rmrf(const char* path) {
+/* remove name (relative to dirfd dfd) recursively. Everything is done relative
+ * to already opened directory fds, and directories are opened with O_NOFOLLOW,
+ * so swapping an entry for a symlink while we run (we run as root, the tree is
+ * user-owned) can't make us descend outside of it. */
+static int rmrf_at(int dfd, const char* name) {
   int r = 0;
+  int fd;
   DIR* dir;
   struct dirent* dp;
-  int lp;
 
-  if (unlink(path) == 0)
+  if (unlinkat(dfd, name, 0) == 0)
     return 0;
   else if (errno != EISDIR)
     return -1;
 
-  dir = opendir(path);
-  if (!dir) return -1;
-  lp = strlen(path);
-  for (dp = readdir(dir); dp != NULL; dp = readdir(dir)) {
-    if (strcmp(dp->d_name, ".") != 0 && strcmp(dp->d_name, "..") != 0) {
-      int l = lp + strlen(dp->d_name) + 2;
-      char name[l];
+  do {
+    fd = openat(dfd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) return -1;
 
-      memcpy(name, path, lp);
-      name[lp] = '/';
-      memcpy(name + lp + 1, dp->d_name, l - lp - 1);
-
-      r += rmrf(name);
-    }
+  dir = fdopendir(fd);
+  if (!dir) {
+    close(fd);
+    return -1;
   }
-  closedir(dir);
-  if (rmdir(path) < 0) --r;
+  for (dp = readdir(dir); dp != NULL; dp = readdir(dir)) {
+    if (strcmp(dp->d_name, ".") != 0 && strcmp(dp->d_name, "..") != 0)
+      r += rmrf_at(fd, dp->d_name);
+  }
+  closedir(dir); /* also closes fd */
+  if (unlinkat(dfd, name, AT_REMOVEDIR) < 0) --r;
 
   return r;
 }
+
+static int rmrf(const char* path) { return rmrf_at(AT_FDCWD, path); }
 
 PAM_EXTERN int pam_sm_close_session(pam_handle_t* pamh, int flags, int argc,
                                     const char** argv) {
@@ -238,14 +243,14 @@ PAM_EXTERN int pam_sm_close_session(pam_handle_t* pamh, int flags, int argc,
   if (!pw) return PAM_USER_UNKNOWN;
 
   /* get length for uid as ascii string, i.e. in file/folder name */
-  l = intlen((int)pw->pw_uid);
+  l = intlen(pw->pw_uid);
 
   {
     char file[sizeof(PARENT_DIR) + l + 2];
     int fd;
     int count = 0;
 
-    print_filename(file, (int)pw->pw_uid, l);
+    print_filename(file, pw->pw_uid, l);
     fd = open_and_lock(file);
     if (fd < 0) return PAM_SESSION_ERR;
 
@@ -297,14 +302,14 @@ PAM_EXTERN int pam_sm_open_session(pam_handle_t* pamh, int flags, int argc,
   if (!pw) return PAM_USER_UNKNOWN;
 
   /* get length for uid as ascii string, i.e. in file/folder name */
-  l = intlen((int)pw->pw_uid);
+  l = intlen(pw->pw_uid);
 
   {
     char file[sizeof(PARENT_DIR) + l + 2];
     int fd;
     int count = 0;
 
-    print_filename(file, (int)pw->pw_uid, l);
+    print_filename(file, pw->pw_uid, l);
     fd = open_and_lock(file);
     if (fd < 0) return PAM_SESSION_ERR;
 
